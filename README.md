@@ -6,24 +6,7 @@ A modern web-based tool for annotating farm harvest images with temporal image s
 
 ## 🚀 Quick Start
 
-### Automated Setup (Recommended)
-
-**Windows (PowerShell):**
-
-```powershell
-.\setup.ps1
-```
-
-**Linux/Mac:**
-
-```bash
-chmod +x setup.sh
-./setup.sh
-```
-
-### Manual Setup
-
-#### 1. Backend Setup
+### 1. Backend Setup
 
 ```bash
 cd backend
@@ -33,7 +16,7 @@ python -m uvicorn app:app --host 0.0.0.0 --port 5005 --reload
 
 Backend runs on `http://localhost:5005`
 
-#### 2. Frontend Setup
+### 2. Frontend Setup
 
 ```bash
 cd frontend
@@ -49,19 +32,15 @@ Frontend runs on `http://localhost:3000`
 
 ```
 CNH/
-├── app/                    # Flask/FastAPI backend
-│   ├── app.py             # Main Flask application (with CORS enabled)
-│   ├── app_fastapi.py     # FastAPI version (see FASTAPI_MIGRATION.md)
-│   ├── static/            # Static files (thumbnails, CSS, JS)
-│   ├── templates/         # (Legacy) Flask templates
-│   ├── requirements.txt   # Python dependencies (Flask)
-│   ├── requirements_fastapi.txt # Python dependencies (FastAPI)
+├── backend/               # FastAPI backend
+│   ├── app.py             # Main FastAPI application (with CORS enabled)
+│   ├── requirements.txt   # Python dependencies
 │   └── ...
-├── frontend/              # Next.js frontend
+├── frontend/             # Next.js frontend
 │   ├── app/              # Next.js app directory
 │   ├── components/       # React components
 │   ├── public/           # Static assets
-│   ├── .env.local        # Environment variables
+│   ├── .env              # Environment variables
 │   └── package.json      # Node dependencies
 ├── farm_dataset/         # Farm images dataset
 ├── thumbnail_cache/      # Generated thumbnails
@@ -96,14 +75,6 @@ CNH/
 
 ---
 
-## ⌨️ Keyboard Shortcuts
-
-- `←` Arrow Left: Previous Farm
-- `→` Arrow Right: Next Farm
-- `Enter`: Save Selection
-
----
-
 ## 🔧 Configuration
 
 ### Backend (Flask/FastAPI)
@@ -116,7 +87,7 @@ CNH/
 
 ### Frontend (Next.js)
 
-- Edit `frontend/.env.local` for API URL and environment variables
+- Edit `frontend/.env` for API URL and environment variables
 - Next.js rewrites are configured to proxy API requests to the backend
 
 ---
@@ -152,8 +123,8 @@ farm_id,selected_image,image_path,total_images,timestamp
 
 ### Backend
 
-- Flask 2.0+ or FastAPI 0.104+
-- Flask-CORS 3.0+ or FastAPI CORS Middleware
+- FastAPI 0.104+
+- FastAPI CORS Middleware
 - Pillow (image processing)
 - Python 3.8+
 - SQLite (default) or PostgreSQL (scalable)
