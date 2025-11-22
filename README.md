@@ -77,13 +77,13 @@ CNH/
 
 ## 🔧 Configuration
 
-### Backend (Flask/FastAPI)
+### Backend (FastAPI)
 
-- Edit `app/app.py` or `app/app_fastapi.py` for:
+- Edit `app/app.py` for:
+
   - Dataset directory path
   - Port configuration
   - CORS settings
-- See `BACKEND_SETUP.md` for CORS and production setup
 
 ### Frontend (Next.js)
 
