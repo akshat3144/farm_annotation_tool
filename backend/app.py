@@ -1,221 +1,169 @@
 """
-FastAPI version of Farm Harvest Annotation Tool
-Migrated from Flask to FastAPI for better performance and async support
+FastAPI Farm Harvest Annotation Tool with JWT Auth & MongoDB
+Complete system with authentication, admin dashboard, and MongoDB Atlas
 """
-from fastapi import FastAPI, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Depends, status, Query
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.sessions import SessionMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import os
 import json
 import csv
-from datetime import datetime
+import io
+from datetime import datetime, timedelta
 from PIL import Image
 import hashlib
 import re
 import numpy as np
 from typing import Optional, Dict, Any, List
 import rasterio
-from rasterio.plot import reshape_as_image
+from dotenv import load_dotenv
+
+# Local imports
+from database import (
+    connect_to_mongo, 
+    close_mongo_connection, 
+    get_database,
+    USERS_COLLECTION,
+    ANNOTATIONS_COLLECTION,
+    ASSIGNMENTS_COLLECTION
+)
+from models import (
+    UserCreate, UserResponse, UserInDB,
+    AnnotationCreate, AnnotationResponse,
+    FarmAssignment,
+    Token, LoginRequest
+)
+from auth import (
+    verify_password, 
+    get_password_hash, 
+    create_access_token, 
+    decode_access_token
+)
+from image_utils import make_thumbnail, parse_date_from_filename
+
+load_dotenv()
 
 # Initialize FastAPI app
 app = FastAPI(
     title="Farm Harvest Annotation Tool API",
-    version="2.0",
-    description="API for farm harvest annotation with Next.js frontend"
+    version="3.0",
+    description="API with JWT Auth, MongoDB, and Admin Dashboard"
 )
 
-# Add session middleware (replaces Flask sessions)
-app.add_middleware(
-    SessionMiddleware,
-    secret_key='harvest_annotation_secret_key_2025'  # Change this in production
-)
+# Security
+security = HTTPBearer()
 
-# Enable CORS for Next.js frontend
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://localhost:3001"],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
     allow_headers=["*"],
 )
 
-# Root directory for dataset and other project files
+# Root directory
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-# Configuration
 FARM_DATASET_DIR = os.path.join(ROOT_DIR, "farm_dataset")
-CSV_FILE = os.path.join(ROOT_DIR, "harvest_annotations.csv")
 FARM_INDEX_PATH = os.path.join(ROOT_DIR, 'farm_index.json')
-USER_ANNOTATIONS_DIR = os.path.join(ROOT_DIR, 'annotations_by_user')
-os.makedirs(USER_ANNOTATIONS_DIR, exist_ok=True)
 
-# Thumbnail cache directory
+# Thumbnail cache
 THUMB_CACHE_DIR = os.path.join(ROOT_DIR, 'thumbnail_cache')
 os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
 
 
-def _thumb_path_for(img_path: str) -> str:
-    """Return the expected thumbnail path for an image path (hash-based filename)."""
-    h = hashlib.sha256(img_path.encode('utf-8')).hexdigest()
-    return os.path.join(THUMB_CACHE_DIR, f"{h}.png")
+# Startup/Shutdown Events
+@app.on_event("startup")
+async def startup_db_client():
+    """Connect to MongoDB on startup"""
+    await connect_to_mongo()
+    await initialize_default_admin()
 
 
-def make_thumbnail(source_path: str, width: int = 300, height: int = 300) -> Optional[str]:
-    """Generate (and cache) a thumbnail for `source_path` with the requested size.
-    Returns the filesystem path to the thumbnail image, or None on failure.
-    Handles multispectral TIFF files using rasterio.
-    """
-    if not os.path.isfile(source_path):
-        return None
-
-    # Deterministic cache name that includes size
-    base_h = hashlib.sha256(source_path.encode('utf-8')).hexdigest()
-    thumb_name = f"{base_h}_{width}x{height}.png"
-    thumb_path = os.path.join(THUMB_CACHE_DIR, thumb_name)
-
-    if os.path.isfile(thumb_path):
-        return thumb_path
-
-    try:
-        # Check if it's a TIFF file that might need special handling
-        if source_path.lower().endswith(('.tif', '.tiff')):
-            # First, try using rasterio for multispectral/complex TIFFs
-            try:
-                with rasterio.open(source_path) as src:
-                    # Read the data
-                    data = src.read()
-                    
-                    print(f"  - TIFF bands: {data.shape[0]}, size: {data.shape[1]}x{data.shape[2]}")
-                    
-                    # Handle different band counts
-                    if data.shape[0] >= 3:
-                        # Multi-band: Use first 3 bands as RGB (or bands that make visual sense)
-                        # Typically bands 1-3 are Red, Green, Blue or NIR, Red, Green
-                        # Try common combinations
-                        if data.shape[0] >= 4:
-                            # For 4+ bands, try to pick RGB-like bands (often 3,2,1 or 4,3,2)
-                            # Use bands 3,2,1 (0-indexed: 2,1,0) which often corresponds to RGB
-                            rgb = np.stack([
-                                data[2, :, :],  # Red
-                                data[1, :, :],  # Green
-                                data[0, :, :]   # Blue
-                            ], axis=-1)
-                        else:
-                            # 3 bands: assume RGB
-                            rgb = np.stack([
-                                data[0, :, :],
-                                data[1, :, :],
-                                data[2, :, :]
-                            ], axis=-1)
-                    elif data.shape[0] == 1:
-                        # Single band: grayscale
-                        rgb = data[0, :, :]
-                    else:
-                        raise ValueError(f"Unsupported band count: {data.shape[0]}")
-                    
-                    # Normalize to 0-255 range
-                    if rgb.dtype in [np.float32, np.float64]:
-                        # Float data
-                        rgb_min, rgb_max = rgb.min(), rgb.max()
-                        if rgb_max > rgb_min:
-                            rgb = ((rgb - rgb_min) / (rgb_max - rgb_min) * 255).astype(np.uint8)
-                        else:
-                            rgb = np.zeros_like(rgb, dtype=np.uint8)
-                    elif rgb.dtype == np.uint16:
-                        # 16-bit integer
-                        rgb_min, rgb_max = rgb.min(), rgb.max()
-                        if rgb_max > rgb_min:
-                            rgb = ((rgb.astype(np.float32) - rgb_min) / (rgb_max - rgb_min) * 255).astype(np.uint8)
-                        else:
-                            rgb = np.zeros_like(rgb, dtype=np.uint8)
-                    elif rgb.dtype != np.uint8:
-                        # Other types: try to normalize
-                        rgb_min, rgb_max = rgb.min(), rgb.max()
-                        if rgb_max > rgb_min:
-                            rgb = ((rgb.astype(np.float32) - rgb_min) / (rgb_max - rgb_min) * 255).astype(np.uint8)
-                        else:
-                            rgb = np.zeros_like(rgb, dtype=np.uint8)
-                    
-                    # Create PIL Image
-                    if len(rgb.shape) == 3:
-                        im = Image.fromarray(rgb, mode='RGB')
-                    else:
-                        im = Image.fromarray(rgb, mode='L').convert('RGB')
-                    
-                    # Create thumbnail
-                    im.thumbnail((width, height), Image.LANCZOS)
-                    im.save(thumb_path, format='PNG', optimize=True)
-                    
-                    print(f"✓ Generated thumbnail for multispectral TIFF: {os.path.basename(source_path)}")
-                    return thumb_path
-                    
-            except Exception as e:
-                print(f"  - Rasterio failed, trying PIL: {e}")
-                # Fall back to PIL for simpler TIFFs
-                try:
-                    with Image.open(source_path) as im:
-                        # For multi-page TIFFs, seek to first page
-                        im.seek(0)
-                        
-                        # Convert to RGB mode based on current mode
-                        if im.mode in ('RGB', 'RGBA'):
-                            im = im.convert('RGB')
-                        elif im.mode == 'L':
-                            im = im.convert('RGB')
-                        elif im.mode in ('I', 'I;16', 'I;16B', 'I;16L', 'I;16N'):
-                            # 16-bit integer modes
-                            arr = np.array(im, dtype=np.float32)
-                            arr_min, arr_max = arr.min(), arr.max()
-                            if arr_max > arr_min:
-                                arr = ((arr - arr_min) / (arr_max - arr_min) * 255).astype(np.uint8)
-                            else:
-                                arr = np.zeros_like(arr, dtype=np.uint8)
-                            im = Image.fromarray(arr, mode='L').convert('RGB')
-                        elif im.mode == 'F':
-                            # 32-bit floating point
-                            arr = np.array(im)
-                            arr_min, arr_max = arr.min(), arr.max()
-                            if arr_max > arr_min:
-                                arr = ((arr - arr_min) / (arr_max - arr_min) * 255).astype(np.uint8)
-                            else:
-                                arr = np.zeros_like(arr, dtype=np.uint8)
-                            im = Image.fromarray(arr, mode='L').convert('RGB')
-                        else:
-                            im = im.convert('RGB')
-                        
-                        # Create thumbnail
-                        im.thumbnail((width, height), Image.LANCZOS)
-                        im.save(thumb_path, format='PNG', optimize=True)
-                        
-                    print(f"✓ Generated thumbnail for TIFF using PIL: {os.path.basename(source_path)}")
-                    return thumb_path
-                except Exception as pil_error:
-                    print(f"✗ Both rasterio and PIL failed for {source_path}")
-                    print(f"  - Rasterio error: {e}")
-                    print(f"  - PIL error: {pil_error}")
-                    import traceback
-                    traceback.print_exc()
-                    return None
-        else:
-            # Standard image processing for PNG, JPG, etc.
-            with Image.open(source_path) as im:
-                im = im.convert('RGB')
-                im.thumbnail((width, height), Image.LANCZOS)
-                im.save(thumb_path, format='PNG', optimize=True)
-            return thumb_path
-    except Exception as e:
-        print(f"✗ Thumbnail generation error for {source_path}: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    """Close MongoDB connection on shutdown"""
+    await close_mongo_connection()
 
 
-# Load or build farm index once (memory efficient: only farm ids and paths stored)
+async def initialize_default_admin():
+    """Create default admin user if it doesn't exist"""
+    db = get_database()
+    users_collection = db[USERS_COLLECTION]
+    
+    admin_username = os.getenv("DEFAULT_ADMIN_USERNAME", "admin")
+    admin_password = os.getenv("DEFAULT_ADMIN_PASSWORD", "admin123")
+    
+    existing_admin = await users_collection.find_one({"username": admin_username})
+    
+    if not existing_admin:
+        admin_user = {
+            "username": admin_username,
+            "email": "admin@farmtool.com",
+            "full_name": "Administrator",
+            "role": "admin",
+            "is_active": True,
+            "hashed_password": get_password_hash(admin_password),
+            "created_at": datetime.now()
+        }
+        await users_collection.insert_one(admin_user)
+        print(f"✓ Default admin user created: {admin_username}")
+
+
+# Authentication Dependency
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    """Get current authenticated user from JWT token"""
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    token = credentials.credentials
+    payload = decode_access_token(token)
+    
+    if payload is None:
+        raise credentials_exception
+    
+    username: str = payload.get("sub")
+    role: str = payload.get("role")
+    
+    if username is None:
+        raise credentials_exception
+    
+    db = get_database()
+    user = await db[USERS_COLLECTION].find_one({"username": username})
+    
+    if user is None:
+        raise credentials_exception
+    
+    return {
+        "id": str(user["_id"]),
+        "username": user["username"],
+        "role": user["role"],
+        "email": user.get("email"),
+        "full_name": user.get("full_name"),
+        "is_active": user.get("is_active", True)
+    }
+
+
+async def require_admin(current_user: dict = Depends(get_current_user)) -> dict:
+    """Require admin role"""
+    if current_user["role"] != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required"
+        )
+    return current_user
+
+
+# Farm Index and Data Functions
 _FARM_INDEX: Optional[List[Dict[str, str]]] = None
 
 
 def build_farm_index(force: bool = False) -> List[Dict[str, str]]:
+    """Build farm index from dataset directory"""
     global _FARM_INDEX
     if _FARM_INDEX is not None and not force:
         return _FARM_INDEX
@@ -241,7 +189,6 @@ def build_farm_index(force: bool = False) -> List[Dict[str, str]]:
         except Exception:
             farm_list = []
 
-    # Fallback: try loading prebuilt farm_index.json
     if os.path.exists(FARM_INDEX_PATH) and not force:
         try:
             with open(FARM_INDEX_PATH, 'r') as fh:
@@ -258,196 +205,467 @@ def build_farm_index(force: bool = False) -> List[Dict[str, str]]:
 build_farm_index()
 
 
-def parse_date_from_filename(filename_or_path: str) -> tuple:
-    """Parse date from a filename (or full path). Return a sortable tuple (year, month_num, day)."""
-    try:
-        filename = os.path.basename(filename_or_path)
-    except Exception:
-        filename = str(filename_or_path)
-    filename_lower = filename.lower()
-    
-    # Try the new enhanced dataset format: YYYY_MM_DD.png
-    enhanced_pattern = r'^(\d{4})_(\d{1,2})_(\d{1,2})\.png$'
-    match = re.search(enhanced_pattern, filename_lower)
-    if match:
-        year = int(match.group(1))
-        month = int(match.group(2))
-        day = int(match.group(3))
-        return (year, month, day)
-    
-    # Month name mapping
-    month_map = {
-        'jan': 1, 'january': 1,
-        'feb': 2, 'february': 2,
-        'mar': 3, 'march': 3,
-        'apr': 4, 'april': 4,
-        'may': 5,
-        'jun': 6, 'june': 6,
-        'jul': 7, 'july': 7,
-        'aug': 8, 'august': 8,
-        'sep': 9, 'sept': 9, 'september': 9,
-        'oct': 10, 'october': 10,
-        'nov': 11, 'november': 11,
-        'dec': 12, 'december': 12
-    }
-    
-    # Try different legacy patterns
-    patterns = [
-        r'([a-z]+)_(\d{4})',
-        r'(\d+)([a-z]+),(\d{4})',
-        r'(\d+)([a-z]+)(\d{4})',
-        r'([a-z]+)(\d+)_(\d{4})',
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, filename_lower)
-        if match:
-            groups = match.groups()
-            
-            if len(groups) == 2:
-                month_str, year_str = groups
-                if month_str in month_map:
-                    return (int(year_str), month_map[month_str], 1)
-                    
-            elif len(groups) == 3:
-                if groups[0].isdigit():
-                    day_str, month_str, year_str = groups
-                    if month_str in month_map:
-                        return (int(year_str), month_map[month_str], int(day_str))
-                else:
-                    month_str, day_str, year_str = groups
-                    if month_str in month_map:
-                        return (int(year_str), month_map[month_str], int(day_str))
-    
-    # Try to extract year at least
-    year_match = re.search(r'20\d{2}', filename)
-    if year_match:
-        year = int(year_match.group())
-        return (year, 0, 0)
-
-    # Last resort: use file modification time
-    try:
-        if os.path.exists(filename_or_path):
-            mtime = os.path.getmtime(filename_or_path)
-            dt = datetime.fromtimestamp(mtime)
-            return (dt.year, dt.month, dt.day)
-    except Exception:
-        pass
-
-    return (2024, 0, 0)
-
-
-_FARM_GROUPS_CACHE: Optional[List[Dict[str, Any]]] = None
-_FARM_GROUPS_CACHE_TS: float = 0
-
-
-def find_farm_groups() -> List[Dict[str, Any]]:
-    """Scan farm_dataset folder and organize by farm ID and time series."""
-    global _FARM_GROUPS_CACHE, _FARM_GROUPS_CACHE_TS
-    
-    CACHE_TTL = 5.0
-    now_ts = datetime.now().timestamp()
-    if _FARM_GROUPS_CACHE and (now_ts - _FARM_GROUPS_CACHE_TS) < CACHE_TTL:
-        return _FARM_GROUPS_CACHE
-
-    groups = []
-    farms_index = build_farm_index()
-    
-    if farms_index:
-        for entry in farms_index:
-            farm_id = entry.get('farm_id')
-            farm_path = entry.get('farm_path') or os.path.join(FARM_DATASET_DIR, farm_id)
-            if not os.path.isdir(farm_path):
-                continue
-
-            images = []
-            try:
-                for file in os.listdir(farm_path):
-                    if file.lower().endswith(('.tif', '.tiff', '.png')):
-                        images.append(os.path.join(farm_path, file))
-            except Exception:
-                images = []
-
-            images.sort(key=lambda x: parse_date_from_filename(x))
-            if images:
-                groups.append({
-                    'farm_id': farm_id,
-                    'images': images,
-                    'image_count': len(images)
-                })
-    else:
-        # Fallback: scan FARM_DATASET_DIR directly
-        if os.path.isdir(FARM_DATASET_DIR):
-            farm_dirs = [d for d in os.listdir(FARM_DATASET_DIR)
-                         if os.path.isdir(os.path.join(FARM_DATASET_DIR, d)) and d != '0']
-            farm_dirs.sort()
-            for farm_id in farm_dirs:
-                farm_path = os.path.join(FARM_DATASET_DIR, farm_id)
-                images = []
-                try:
-                    for file in os.listdir(farm_path):
-                        if file.lower().endswith(('.tif', '.tiff', '.png')):
-                            images.append(os.path.join(farm_path, file))
-                except Exception:
-                    images = []
-
-                images.sort(key=lambda x: parse_date_from_filename(x))
-                if images:
-                    groups.append({
-                        'farm_id': farm_id,
-                        'images': images,
-                        'image_count': len(images)
-                    })
-
-    _FARM_GROUPS_CACHE = groups
-    _FARM_GROUPS_CACHE_TS = datetime.now().timestamp()
-    return groups
-
-
-# API Routes
+# ============================================================================
+# PUBLIC ROUTES (No Auth Required)
+# ============================================================================
 
 @app.get("/")
 async def index():
-    """API documentation endpoint"""
+    """API documentation"""
     return {
-        'message': 'Farm Harvest Annotation Tool API',
-        'version': '2.0',
-        'framework': 'FastAPI',
-        'frontend': 'Next.js frontend available at http://localhost:3000',
-        'endpoints': {
-            'status': '/api/status',
-            'farm': '/api/farm/<farm_id>',
-            'navigate': '/api/navigate',
-            'save': '/api/save_annotation',
-            'skip': '/api/skip_farm',
-            'reset': '/api/reset',
-            'thumbnail': '/api/thumbnail'
+        'message': 'Farm Harvest Annotation Tool API v3.0',
+        'features': [
+            'JWT Authentication',
+            'MongoDB Atlas Integration',
+            'Admin Dashboard',
+            'User Management',
+            'Farm Assignment System'
+        ],
+        'auth': {
+            'login': 'POST /api/auth/login',
+            'me': 'GET /api/auth/me'
+        },
+        'admin': {
+            'users': 'GET/POST /api/admin/users',
+            'assignments': 'GET/POST /api/admin/assignments',
+            'stats': 'GET /api/admin/stats',
+            'download': 'GET /api/admin/download'
+        },
+        'annotator': {
+            'assigned_farms': 'GET /api/annotator/assigned-farms',
+            'farm_data': 'GET /api/annotator/farm/{farm_id}',
+            'save_annotation': 'POST /api/annotator/save',
+            'my_stats': 'GET /api/annotator/stats'
         }
     }
 
 
-@app.get("/api/farm/{farm_id}")
-async def get_farm_data(farm_id: str):
-    """Get data for a specific farm by id (lazy-load images)."""
+@app.post("/api/auth/login")
+async def login(login_data: LoginRequest):
+    """Login endpoint - returns JWT token"""
+    db = get_database()
+    user = await db[USERS_COLLECTION].find_one({"username": login_data.username})
+    
+    if not user or not verify_password(login_data.password, user["hashed_password"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password"
+        )
+    
+    if not user.get("is_active", True):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User account is disabled"
+        )
+    
+    # Create access token
+    access_token = create_access_token(
+        data={"sub": user["username"], "role": user["role"]}
+    )
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {
+            "username": user["username"],
+            "role": user["role"],
+            "email": user.get("email"),
+            "full_name": user.get("full_name")
+        }
+    }
+
+
+@app.get("/api/auth/me")
+async def get_me(current_user: dict = Depends(get_current_user)):
+    """Get current user info"""
+    return current_user
+
+
+# ============================================================================
+# ADMIN ROUTES (Admin Only)
+# ============================================================================
+
+@app.get("/api/admin/users")
+async def get_all_users(admin: dict = Depends(require_admin)):
+    """Get all users (admin only)"""
+    db = get_database()
+    users = await db[USERS_COLLECTION].find().to_list(1000)
+    
+    return [
+        {
+            "id": str(user["_id"]),
+            "username": user["username"],
+            "email": user.get("email"),
+            "full_name": user.get("full_name"),
+            "role": user["role"],
+            "is_active": user.get("is_active", True),
+            "created_at": user.get("created_at", datetime.now()).isoformat()
+        }
+        for user in users
+    ]
+
+
+@app.post("/api/admin/users")
+async def create_user(user_data: UserCreate, admin: dict = Depends(require_admin)):
+    """Create new user (admin only)"""
+    db = get_database()
+    
+    # Check if user already exists
+    existing_user = await db[USERS_COLLECTION].find_one({"username": user_data.username})
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username already exists"
+        )
+    
+    # Create new user
+    new_user = {
+        "username": user_data.username,
+        "email": user_data.email,
+        "full_name": user_data.full_name,
+        "role": user_data.role,
+        "is_active": user_data.is_active,
+        "hashed_password": get_password_hash(user_data.password),
+        "created_at": datetime.now()
+    }
+    
+    result = await db[USERS_COLLECTION].insert_one(new_user)
+    new_user["id"] = str(result.inserted_id)
+    
+    return {
+        "id": new_user["id"],
+        "username": new_user["username"],
+        "email": new_user.get("email"),
+        "full_name": new_user.get("full_name"),
+        "role": new_user["role"],
+        "created_at": new_user["created_at"].isoformat()
+    }
+
+
+@app.patch("/api/admin/users/{user_id}")
+async def update_user(
+    user_id: str,
+    updates: dict,
+    admin: dict = Depends(require_admin)
+):
+    """Update user (admin only)"""
+    db = get_database()
+    from bson import ObjectId
+    
+    # Remove password from updates if present (use separate endpoint)
+    if "password" in updates:
+        updates["hashed_password"] = get_password_hash(updates.pop("password"))
+    
+    result = await db[USERS_COLLECTION].update_one(
+        {"_id": ObjectId(user_id)},
+        {"$set": updates}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return {"success": True, "message": "User updated"}
+
+
+@app.delete("/api/admin/users/{user_id}")
+async def delete_user(user_id: str, admin: dict = Depends(require_admin)):
+    """Delete user (admin only)"""
+    db = get_database()
+    from bson import ObjectId
+    
+    result = await db[USERS_COLLECTION].delete_one({"_id": ObjectId(user_id)})
+    
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return {"success": True, "message": "User deleted"}
+
+
+@app.get("/api/admin/assignments")
+async def get_all_assignments(admin: dict = Depends(require_admin)):
+    """Get all farm assignments (admin only)"""
+    db = get_database()
+    assignments = await db[ASSIGNMENTS_COLLECTION].find().to_list(1000)
+    
+    # Get completion stats for each assignment
+    result = []
+    for assignment in assignments:
+        user_id = assignment["user_id"]
+        farm_ids = assignment.get("farm_ids", [])
+        
+        # Count completed annotations
+        completed = await db[ANNOTATIONS_COLLECTION].count_documents({
+            "user_id": user_id,
+            "farm_id": {"$in": farm_ids}
+        })
+        
+        result.append({
+            "id": str(assignment["_id"]),
+            "user_id": assignment["user_id"],
+            "username": assignment["username"],
+            "farm_ids": farm_ids,
+            "assigned_count": len(farm_ids),
+            "completed_count": completed,
+            "assigned_at": assignment.get("assigned_at", datetime.now()).isoformat(),
+            "status": assignment.get("status", "active")
+        })
+    
+    return result
+
+
+@app.post("/api/admin/assignments")
+async def create_assignment(
+    assignment_data: dict,
+    admin: dict = Depends(require_admin)
+):
+    """Create farm assignment (admin only)"""
+    db = get_database()
+    from bson import ObjectId
+    
+    user_id = assignment_data.get("user_id")
+    farm_count = assignment_data.get("farm_count")
+    
+    # Verify user exists
+    user = await db[USERS_COLLECTION].find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Get all farms
+    all_farms = build_farm_index()
+    all_farm_ids = [f["farm_id"] for f in all_farms]
+    
+    # Get already assigned farms
+    assignments = await db[ASSIGNMENTS_COLLECTION].find().to_list(1000)
+    assigned_farm_ids = set()
+    for assignment in assignments:
+        assigned_farm_ids.update(assignment.get("farm_ids", []))
+    
+    # Get unassigned farms
+    unassigned_farms = [fid for fid in all_farm_ids if fid not in assigned_farm_ids]
+    
+    if len(unassigned_farms) < farm_count:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Only {len(unassigned_farms)} unassigned farms available, but {farm_count} requested"
+        )
+    
+    # Select farms to assign
+    farm_ids = unassigned_farms[:farm_count]
+    
+    # Create assignment
+    new_assignment = {
+        "user_id": user_id,
+        "username": user["username"],
+        "farm_ids": farm_ids,
+        "assigned_at": datetime.now(),
+        "completed_count": 0,
+        "status": "active"
+    }
+    
+    result = await db[ASSIGNMENTS_COLLECTION].insert_one(new_assignment)
+    
+    return {
+        "id": str(result.inserted_id),
+        "user_id": user_id,
+        "username": user["username"],
+        "farm_ids": farm_ids,
+        "assigned_count": len(farm_ids)
+    }
+
+
+@app.delete("/api/admin/assignments/{assignment_id}")
+async def delete_assignment(assignment_id: str, admin: dict = Depends(require_admin)):
+    """Delete assignment (admin only)"""
+    db = get_database()
+    from bson import ObjectId
+    
+    result = await db[ASSIGNMENTS_COLLECTION].delete_one({"_id": ObjectId(assignment_id)})
+    
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+    
+    return {"success": True, "message": "Assignment deleted"}
+
+
+@app.delete("/api/admin/annotations/clear")
+async def clear_all_annotations(admin: dict = Depends(require_admin)):
+    """Clear all annotations (admin only)"""
+    db = get_database()
+    
+    result = await db[ANNOTATIONS_COLLECTION].delete_many({})
+    
+    return {
+        "success": True,
+        "message": f"Deleted {result.deleted_count} annotations",
+        "deleted_count": result.deleted_count
+    }
+
+
+@app.get("/api/admin/stats")
+async def get_admin_stats(admin: dict = Depends(require_admin)):
+    """Get overall statistics (admin only)"""
+    db = get_database()
+    
+    total_users = await db[USERS_COLLECTION].count_documents({"role": "annotator"})
+    total_annotations = await db[ANNOTATIONS_COLLECTION].count_documents({})
+    total_assignments = await db[ASSIGNMENTS_COLLECTION].count_documents({})
+    
+    # Get farms count
+    farms = build_farm_index()
+    total_farms = len(farms)
+    
+    # Get assigned farms count
+    assignments = await db[ASSIGNMENTS_COLLECTION].find().to_list(1000)
+    assigned_farms = set()
+    for assignment in assignments:
+        assigned_farms.update(assignment.get("farm_ids", []))
+    
+    # Get user stats
+    user_stats = []
+    users = await db[USERS_COLLECTION].find({"role": "annotator"}).to_list(1000)
+    for user in users:
+        user_id = str(user["_id"])
+        annotations_count = await db[ANNOTATIONS_COLLECTION].count_documents({"user_id": user_id})
+        assignment = await db[ASSIGNMENTS_COLLECTION].find_one({"user_id": user_id})
+        assigned_count = len(assignment.get("farm_ids", [])) if assignment else 0
+        
+        user_stats.append({
+            "username": user["username"],
+            "assigned": assigned_count,
+            "completed": annotations_count,
+            "progress": round((annotations_count / assigned_count * 100) if assigned_count > 0 else 0, 2)
+        })
+    
+    return {
+        "total_users": total_users,
+        "total_farms": total_farms,
+        "assigned_farms": len(assigned_farms),
+        "unassigned_farms": total_farms - len(assigned_farms),
+        "total_annotations": total_annotations,
+        "total_assignments": total_assignments,
+        "user_stats": user_stats
+    }
+
+
+@app.get("/api/admin/download")
+async def download_annotations(admin: dict = Depends(require_admin), format: str = Query("csv")):
+    """Download all annotations (admin only)"""
+    db = get_database()
+    annotations = await db[ANNOTATIONS_COLLECTION].find().to_list(10000)
+    
+    if format == "csv":
+        # Create CSV
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["farm_id", "username", "selected_image", "image_path", "total_images", "timestamp"])
+        
+        for annotation in annotations:
+            writer.writerow([
+                annotation["farm_id"],
+                annotation["username"],
+                annotation["selected_image"],
+                annotation["image_path"],
+                annotation.get("total_images", ""),
+                annotation.get("timestamp", datetime.now()).isoformat()
+            ])
+        
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=annotations_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"}
+        )
+    
+    elif format == "json":
+        # Return as JSON
+        result = []
+        for annotation in annotations:
+            result.append({
+                "id": str(annotation["_id"]),
+                "farm_id": annotation["farm_id"],
+                "username": annotation["username"],
+                "selected_image": annotation["selected_image"],
+                "image_path": annotation["image_path"],
+                "total_images": annotation.get("total_images"),
+                "timestamp": annotation.get("timestamp", datetime.now()).isoformat()
+            })
+        
+        return result
+    
+    else:
+        raise HTTPException(status_code=400, detail="Invalid format. Use 'csv' or 'json'")
+
+
+# ============================================================================
+# ANNOTATOR ROUTES (Authenticated Users)
+# ============================================================================
+
+@app.get("/api/annotator/assigned-farms")
+async def get_assigned_farms(current_user: dict = Depends(get_current_user)):
+    """Get farms assigned to current user"""
+    db = get_database()
+    
+    # Get user's assignment
+    assignment = await db[ASSIGNMENTS_COLLECTION].find_one({"user_id": current_user["id"]})
+    
+    if not assignment:
+        return {"farm_ids": [], "message": "No farms assigned yet"}
+    
+    farm_ids = assignment.get("farm_ids", [])
+    
+    # Get completion status for each farm
+    completed_farms = []
+    annotations = await db[ANNOTATIONS_COLLECTION].find({
+        "user_id": current_user["id"],
+        "farm_id": {"$in": farm_ids}
+    }).to_list(1000)
+    
+    completed_farm_ids = [ann["farm_id"] for ann in annotations]
+    
+    farm_status = []
+    for farm_id in farm_ids:
+        farm_status.append({
+            "farm_id": farm_id,
+            "completed": farm_id in completed_farm_ids
+        })
+    
+    return {
+        "farm_ids": farm_ids,
+        "total_assigned": len(farm_ids),
+        "completed_count": len(completed_farm_ids),
+        "farms": farm_status
+    }
+
+
+@app.get("/api/annotator/farm/{farm_id}")
+async def get_farm_data(farm_id: str, current_user: dict = Depends(get_current_user)):
+    """Get farm data for annotation"""
+    db = get_database()
+    
+    # Check if farm is assigned to user
+    assignment = await db[ASSIGNMENTS_COLLECTION].find_one({
+        "user_id": current_user["id"],
+        "farm_ids": farm_id
+    })
+    
+    if not assignment:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This farm is not assigned to you"
+        )
+    
+    # Get farm images
     farms = build_farm_index()
     farm_entry = next((f for f in farms if f['farm_id'] == farm_id), None)
     
-    if farm_entry is None:
-        possible_path = os.path.join(FARM_DATASET_DIR, farm_id)
-        if os.path.isdir(possible_path):
-            farm_entry = {'farm_id': farm_id, 'farm_path': possible_path}
-            farms.append(farm_entry)
-        else:
-            raise HTTPException(status_code=400, detail='Invalid farm id')
-    
     if not farm_entry:
-        raise HTTPException(status_code=400, detail='Invalid farm id')
-
+        raise HTTPException(status_code=404, detail="Farm not found")
+    
     farm_path = farm_entry['farm_path']
     images = [os.path.join(farm_path, f) for f in os.listdir(farm_path)
               if f.lower().endswith(('.tif', '.tiff', '.png'))]
     images.sort(key=lambda x: parse_date_from_filename(x))
-
+    
     thumbnails = []
     for idx, img_path in enumerate(images):
         filename = os.path.basename(img_path)
@@ -460,7 +678,7 @@ async def get_farm_data(farm_id: str):
                 date_display = f"{month_names[month]} {day}, {year}" if day > 0 else f"{month_names[month]} {year}"
             else:
                 date_display = f"{year}"
-
+            
             thumbnails.append({
                 'index': idx,
                 'filename': filename,
@@ -470,31 +688,24 @@ async def get_farm_data(farm_id: str):
             })
         except Exception:
             continue
-
+    
     thumbnails.sort(key=lambda x: x['sort_date'])
-
-    # Try to load the user's previous selection for this farm
+    
+    # Check if user has already annotated this farm
+    existing_annotation = await db[ANNOTATIONS_COLLECTION].find_one({
+        "user_id": current_user["id"],
+        "farm_id": farm_id
+    })
+    
     selected_index = None
-    try:
-        annotator = 'anonymous'
-        from fastapi import Request as FastapiRequest
-        import inspect
-        for frame in inspect.stack():
-            if 'request' in frame.frame.f_locals:
-                req = frame.frame.f_locals['request']
-                if hasattr(req, 'session'):
-                    annotator = req.session.get('annotator', 'anonymous')
+    if existing_annotation:
+        selected_image = existing_annotation.get("selected_image")
+        # Find index of selected image
+        for idx, thumb in enumerate(thumbnails):
+            if thumb['filename'] == selected_image:
+                selected_index = idx
                 break
-        user_dir = os.path.join(USER_ANNOTATIONS_DIR, annotator)
-        latest_json = os.path.join(user_dir, 'latest.json')
-        if os.path.exists(latest_json):
-            with open(latest_json, 'r', encoding='utf-8') as jf:
-                latest = json.load(jf)
-            if farm_id in latest and 'selected_index' in latest[farm_id]:
-                selected_index = latest[farm_id]['selected_index']
-    except Exception:
-        selected_index = None
-
+    
     return {
         'farm_id': farm_id,
         'image_count': len(images),
@@ -503,257 +714,89 @@ async def get_farm_data(farm_id: str):
     }
 
 
-@app.get("/api/admin/tasks")
-async def admin_tasks():
-    """Admin diagnostics - return filesystem-derived counts."""
-    groups = find_farm_groups()
-    return {'total_farms': len(groups)}
-
-
-@app.post("/api/login")
-async def login(request: Request):
-    """Login endpoint for annotators"""
-    data = await request.json()
-    name = data.get('name')
-    if not name or not str(name).strip():
-        raise HTTPException(status_code=400, detail='Name required')
+@app.post("/api/annotator/save")
+async def save_annotation(
+    annotation_data: dict,
+    current_user: dict = Depends(get_current_user)
+):
+    """Save annotation"""
+    db = get_database()
     
-    name = str(name).strip()
-    request.session['annotator'] = name
+    farm_id = annotation_data.get("farm_id")
+    selected_image = annotation_data.get("selected_image")
+    image_path = annotation_data.get("image_path")
+    total_images = annotation_data.get("total_images")
     
-    # Ensure user's annotation folder exists
-    user_dir = os.path.join(USER_ANNOTATIONS_DIR, name)
-    os.makedirs(user_dir, exist_ok=True)
-    return {'success': True, 'annotator': name}
-
-
-@app.post("/api/claim_batch")
-async def claim_batch(request: Request):
-    """Claim a batch of farms for the annotator (simple session-based)."""
-    annotator = request.session.get('annotator')
-    if not annotator:
-        raise HTTPException(status_code=403, detail='Annotator not logged in')
-
-    data = await request.json()
-    batch_size = int(data.get('batch_size', 100))
-
-    groups = find_farm_groups()
-    claimed = set(request.session.get('claimed_farms', []))
-    farm_ids = []
+    if not farm_id or not selected_image:
+        raise HTTPException(status_code=400, detail="Missing required fields")
     
-    for g in groups:
-        if g['farm_id'] in claimed:
-            continue
-        farm_ids.append(g['farm_id'])
-        if len(farm_ids) >= batch_size:
-            break
-
-    claimed.update(farm_ids)
-    request.session['claimed_farms'] = list(claimed)
-    request.session['current_batch'] = {
-        'annotator': annotator,
-        'farm_ids': farm_ids,
-        'claimed_at': datetime.now().isoformat()
+    # Check if farm is assigned to user
+    assignment = await db[ASSIGNMENTS_COLLECTION].find_one({
+        "user_id": current_user["id"],
+        "farm_ids": farm_id
+    })
+    
+    if not assignment:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This farm is not assigned to you"
+        )
+    
+    # Save annotation (upsert)
+    annotation = {
+        "farm_id": farm_id,
+        "user_id": current_user["id"],
+        "username": current_user["username"],
+        "selected_image": selected_image,
+        "image_path": image_path,
+        "total_images": total_images,
+        "timestamp": datetime.now()
     }
-
-    return {'success': True, 'farm_ids': farm_ids}
-
-
-@app.post("/api/release_batch")
-async def release_batch(request: Request):
-    """Release claimed batch"""
-    annotator = request.session.get('annotator')
-    if not annotator:
-        raise HTTPException(status_code=403, detail='Annotator not logged in')
-
-    batch = request.session.get('current_batch')
-    if not batch or batch.get('annotator') != annotator:
-        raise HTTPException(status_code=400, detail='No batch claimed by this annotator')
-
-    farm_ids = batch.get('farm_ids', [])
-    claimed = set(request.session.get('claimed_farms', []))
-    for fid in farm_ids:
-        claimed.discard(fid)
-    request.session['claimed_farms'] = list(claimed)
-    request.session.pop('current_batch', None)
-    return {'success': True, 'released': farm_ids}
-
-
-@app.get("/api/user_status")
-async def user_status(request: Request):
-    """Get user annotation status"""
-    annotator = request.session.get('annotator')
-    if not annotator:
-        return {'logged_in': False}
-
-    batch = request.session.get('current_batch')
-    completed = 0
     
-    try:
-        user_dir = os.path.join(USER_ANNOTATIONS_DIR, annotator)
-        if os.path.isdir(user_dir):
-            for fn in os.listdir(user_dir):
-                if fn.endswith('.csv'):
-                    with open(os.path.join(user_dir, fn), 'r', encoding='utf-8') as fh:
-                        completed += sum(1 for _ in fh)
-    except Exception:
-        completed = 0
-
-    currently_assigned = len(request.session.get('current_batch', {}).get('farm_ids', []))
-
+    await db[ANNOTATIONS_COLLECTION].update_one(
+        {"user_id": current_user["id"], "farm_id": farm_id},
+        {"$set": annotation},
+        upsert=True
+    )
+    
     return {
-        'logged_in': True,
-        'annotator': annotator,
-        'current_batch': batch,
-        'completed_annotations': completed,
-        'currently_assigned': currently_assigned
+        "success": True,
+        "message": f"Annotation saved for farm {farm_id}"
     }
 
 
-@app.post("/api/navigate")
-async def navigate(request: Request):
-    """Navigate to previous/next farm"""
-    data = await request.json()
-    direction = data.get('direction')
-    groups = find_farm_groups()
-    all_farms = [g['farm_id'] for g in groups]
-
-    if not all_farms:
-        return {'current_farm': None}
-
-    cur_idx = None
-    if isinstance(request.session.get('current_farm'), int):
-        cur_idx = request.session.get('current_farm')
-    elif request.session.get('current_farm_id'):
-        try:
-            cur_idx = all_farms.index(request.session.get('current_farm_id'))
-        except ValueError:
-            cur_idx = 0
-    else:
-        cur_idx = 0
-
-    # Clamp
-    if cur_idx < 0:
-        cur_idx = 0
-    if cur_idx >= len(all_farms):
-        cur_idx = len(all_farms) - 1
-
-    if direction == 'prev' and cur_idx > 0:
-        cur_idx -= 1
-    elif direction == 'next' and cur_idx < len(all_farms) - 1:
-        cur_idx += 1
-
-    request.session['current_farm'] = cur_idx
-    request.session['current_farm_id'] = all_farms[cur_idx]
-
-    return {
-        'current_farm': request.session.get('current_farm_id'),
-        'current_index': cur_idx,
-        'total_farms': len(all_farms)
-    }
-
-
-@app.post("/api/save_annotation")
-async def save_annotation(request: Request):
-    """Save annotation selection"""
-    data = await request.json()
-    farm_id = data.get('farm_id')
-    selected_image = data.get('selected_image')
-    image_path = data.get('image_path')
-    total_images = data.get('total_images', None)
-
-    # Backwards-compatibility
-    if not farm_id and data.get('farm_index') is not None:
-        try:
-            idx = int(data.get('farm_index'))
-            groups = find_farm_groups()
-            if 0 <= idx < len(groups):
-                farm_id = groups[idx]['farm_id']
-        except Exception:
-            farm_id = None
-
-    if farm_id and (not selected_image or not image_path):
-        sel_idx = data.get('selected_image_index')
-        try:
-            if sel_idx is not None:
-                sel_idx = int(sel_idx)
-                farm_path = os.path.join(FARM_DATASET_DIR, farm_id)
-                if os.path.isdir(farm_path):
-                    imgs = [f for f in os.listdir(farm_path) if f.lower().endswith(('.tif', '.tiff', '.png'))]
-                    imgs.sort(key=lambda x: parse_date_from_filename(os.path.basename(x)))
-                    if 0 <= sel_idx < len(imgs):
-                        selected_image = imgs[sel_idx]
-                        image_path = os.path.join(farm_path, selected_image)
-                        total_images = total_images or len(imgs)
-        except Exception:
-            pass
+@app.get("/api/annotator/stats")
+async def get_annotator_stats(current_user: dict = Depends(get_current_user)):
+    """Get current user's annotation statistics"""
+    db = get_database()
     
-    annotator = request.session.get('annotator', 'anonymous')
-
-    if not farm_id or not selected_image or not image_path:
-        raise HTTPException(status_code=400, detail='Missing data')
-
-    timestamp = datetime.now().isoformat()
-
-    try:
-        write_header = not os.path.exists(CSV_FILE)
-        with open(CSV_FILE, "a", newline="", encoding='utf-8') as f:
-            writer = csv.writer(f)
-            if write_header:
-                writer.writerow(["farm_id", "selected_image", "image_path", "total_images", "timestamp"])
-            writer.writerow([farm_id, selected_image, image_path, total_images, timestamp])
-    except Exception:
-        pass
-
-    # Also write per-annotator CSV and persist latest selection in JSON
-    try:
-        annotator_name = request.session.get('annotator', 'anonymous')
-        user_dir = os.path.join(USER_ANNOTATIONS_DIR, annotator_name)
-        os.makedirs(user_dir, exist_ok=True)
-        user_csv = os.path.join(user_dir, f'annotations_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv')
-        with open(user_csv, 'a', newline='', encoding='utf-8') as uf:
-            uw = csv.writer(uf)
-            uw.writerow([farm_id, selected_image, image_path, total_images, timestamp])
-
-        # Persist latest selection in JSON
-        latest_json = os.path.join(user_dir, 'latest.json')
-        try:
-            if os.path.exists(latest_json):
-                with open(latest_json, 'r', encoding='utf-8') as jf:
-                    latest = json.load(jf)
-            else:
-                latest = {}
-        except Exception:
-            latest = {}
-        # Find the selected index for this image
-        selected_index = None
-        farm_path = os.path.join(FARM_DATASET_DIR, farm_id)
-        if os.path.isdir(farm_path):
-            imgs = [f for f in os.listdir(farm_path) if f.lower().endswith(('.tif', '.tiff', '.png'))]
-            imgs.sort(key=lambda x: parse_date_from_filename(os.path.basename(x)))
-            try:
-                selected_index = imgs.index(os.path.basename(selected_image))
-            except Exception:
-                selected_index = None
-        latest[farm_id] = {
-            'selected_image': selected_image,
-            'selected_index': selected_index,
-            'timestamp': timestamp
-        }
-        with open(latest_json, 'w', encoding='utf-8') as jf:
-            json.dump(latest, jf)
-    except Exception:
-        pass
-
+    # Get assignment
+    assignment = await db[ASSIGNMENTS_COLLECTION].find_one({"user_id": current_user["id"]})
+    assigned_count = len(assignment.get("farm_ids", [])) if assignment else 0
+    
+    # Get completed count
+    completed_count = await db[ANNOTATIONS_COLLECTION].count_documents({
+        "user_id": current_user["id"]
+    })
+    
+    progress = round((completed_count / assigned_count * 100) if assigned_count > 0 else 0, 2)
+    
     return {
-        'success': True,
-        'message': f'Saved selection for Farm {farm_id}: {selected_image}'
+        "username": current_user["username"],
+        "assigned": assigned_count,
+        "completed": completed_count,
+        "remaining": assigned_count - completed_count,
+        "progress": progress
     }
 
+
+# ============================================================================
+# IMAGE SERVING ROUTES (Public - No Auth Required)
+# ============================================================================
 
 @app.get("/thumbnails/{farm_id}/{filename:path}")
 async def serve_image(farm_id: str, filename: str):
-    """Serve original images from the dataset safely. Converts TIFF to PNG for browser compatibility."""
+    """Serve original images"""
     safe_farm = os.path.join(FARM_DATASET_DIR, farm_id)
     if not os.path.isdir(safe_farm):
         raise HTTPException(status_code=404, detail='Invalid farm id')
@@ -762,9 +805,8 @@ async def serve_image(farm_id: str, filename: str):
     if not os.path.isfile(file_path):
         raise HTTPException(status_code=404, detail='File not found')
     
-    # If it's a TIFF file, convert to PNG for browser display
+    # If TIFF, convert to PNG
     if filename.lower().endswith(('.tif', '.tiff')):
-        # Generate a web-viewable version at reasonable size
         thumb_path = make_thumbnail(file_path, width=800, height=800)
         if thumb_path and os.path.isfile(thumb_path):
             response = FileResponse(thumb_path, media_type='image/png')
@@ -776,15 +818,14 @@ async def serve_image(farm_id: str, filename: str):
 
 @app.get("/thumbs/{farm_id}/{filename:path}")
 async def serve_thumb(farm_id: str, filename: str):
-    """Serve a pre-generated thumbnail from thumbnail_cache/ if present."""
+    """Serve thumbnail"""
     img_full = os.path.join(FARM_DATASET_DIR, farm_id, filename)
     
     if not os.path.isfile(img_full):
         raise HTTPException(status_code=404, detail='File not found')
     
+    # Look for cached thumbnail
     sized_thumb = None
-    
-    # Look for any sized thumbnail for this image in cache
     try:
         base_hash = hashlib.sha256(img_full.encode('utf-8')).hexdigest()
         for fn in os.listdir(THUMB_CACHE_DIR):
@@ -793,121 +834,34 @@ async def serve_thumb(farm_id: str, filename: str):
                 break
     except Exception:
         pass
-
+    
     if sized_thumb and os.path.isfile(sized_thumb):
         response = FileResponse(sized_thumb, media_type='image/png')
         response.headers["Cache-Control"] = "public, max-age=2592000"
         return response
-
-    # Fallback: try to create thumbnail on-demand
+    
+    # Generate thumbnail
     thumb_path = make_thumbnail(img_full, width=300, height=300)
     if thumb_path and os.path.isfile(thumb_path):
         response = FileResponse(thumb_path, media_type='image/png')
         response.headers["Cache-Control"] = "public, max-age=2592000"
         return response
-
-    # Final fallback: convert TIFF to PNG if needed
+    
     if img_full.lower().endswith(('.tif', '.tiff')):
         raise HTTPException(status_code=500, detail='Failed to generate thumbnail for TIFF')
     
     return FileResponse(img_full)
 
 
-@app.get("/api/thumbnail")
-async def api_thumbnail(
-    farm_id: Optional[str] = Query(None),
-    filename: Optional[str] = Query(None),
-    w: int = Query(300),
-    h: int = Query(300)
-):
-    """On-demand thumbnail endpoint. Query params: farm_id, filename, w, h"""
-    if not farm_id or not filename:
-        raise HTTPException(status_code=400, detail='farm_id and filename required')
-
-    source = os.path.join(FARM_DATASET_DIR, farm_id, filename)
-    
-    if not os.path.isfile(source):
-        raise HTTPException(status_code=404, detail='file not found')
-    
-    thumb_path = make_thumbnail(source, width=w, height=h)
-    
-    if thumb_path and os.path.isfile(thumb_path):
-        response = FileResponse(thumb_path, media_type='image/png')
-        response.headers["Cache-Control"] = "public, max-age=2592000"
-        return response
-
-    # For TIFF files, we must convert - browsers can't display raw TIFF
-    if source.lower().endswith(('.tif', '.tiff')):
-        raise HTTPException(status_code=500, detail='Failed to generate thumbnail for TIFF')
-    
-    # For other formats, serve original
-    return FileResponse(source)
-
-
-@app.post("/api/skip_farm")
-async def skip_farm(request: Request):
-    """Skip current farm without saving selection"""
-    data = await request.json()
-    farm_index = int(data.get('farm_index'))
-    groups = find_farm_groups()
-    
-    if farm_index < len(groups) - 1:
-        request.session['current_farm'] = farm_index + 1
-        new_farm_id = groups[farm_index + 1]['farm_id']
-        return {
-            'success': True,
-            'current_farm': request.session['current_farm'],
-            'current_farm_id': new_farm_id,
-            'current_index': farm_index + 1,
-            'total_farms': len(groups),
-            'message': f'Skipped farm {groups[farm_index]["farm_id"]}'
-        }
-    else:
-        return {
-            'success': True,
-            'completed': True,
-            'message': 'All farms processed!'
-        }
-
-
-@app.get("/api/status")
-async def get_status(request: Request):
-    """Get current annotation status"""
-    groups = find_farm_groups()
-    current_farm_index = request.session.get('current_farm', 0)
-
-    current_farm_id = None
-    try:
-        if 0 <= current_farm_index < len(groups):
-            current_farm_id = groups[current_farm_index]['farm_id']
-    except Exception:
-        current_farm_id = None
-
-    return {
-        'total_farms': len(groups),
-        'current_farm_index': current_farm_index,
-        'current_farm_id': current_farm_id,
-        'completed': current_farm_index >= len(groups)
-    }
-
-
-@app.get("/api/reset")
-async def reset_session(request: Request):
-    """Reset annotation session"""
-    request.session['current_farm'] = 0
-    return {'success': True, 'message': 'Session reset'}
-
-
 if __name__ == '__main__':
     import uvicorn
     
-    print(f"🌾 Farm Harvest Annotation Server (FastAPI)")
+    print(f"🌾 Farm Harvest Annotation Server v3.0 (FastAPI + MongoDB)")
     print(f"📁 Farm dataset: {FARM_DATASET_DIR}")
-    print(f"💾 Annotations CSV: {CSV_FILE}")
-    print(f"🖼️  Image formats: TIFF (.tif/.tiff) and PNG - auto-converted to PNG thumbnails")
-    print(f"📦 Thumbnail cache: {THUMB_CACHE_DIR}")
+    print(f"🔐 JWT Authentication enabled")
+    print(f"💾 MongoDB Atlas integration")
+    print(f"👤 Admin dashboard available")
     print(f"🌐 Starting server at http://localhost:5005")
-    print(f"🔄 CORS enabled for: http://localhost:3000, http://localhost:3001")
     
     uvicorn.run(
         "app:app",

@@ -1,7 +1,7 @@
 "use client";
 
-import { AnnotationTool } from "@/components/AnnotationTool";
+import { Login } from "@/components/Login";
 
 export default function Home() {
-  return <AnnotationTool />;
+  return <Login />;
 }

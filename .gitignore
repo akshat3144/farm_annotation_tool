@@ -2,3 +2,4 @@ annotations_by_user/
 farm_dataset/
 thumbnail_cache/
 backend/__pycache__/
+*.env
