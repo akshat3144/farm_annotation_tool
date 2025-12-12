@@ -50,11 +50,12 @@ def debug_thumbnails():
     print(f"\n🎯 Processing Farm: {farm_id}")
     print(f"📂 Path: {farm_path}")
     
-    # Find TIFF files
+    # Find TIFF files recursively (handles year subdirectories like 2024/, 2025/)
     tiff_files = []
-    for file in os.listdir(farm_path):
-        if file.lower().endswith(('.tif', '.tiff')):
-            tiff_files.append(os.path.join(farm_path, file))
+    for root, dirs, files in os.walk(farm_path):
+        for file in files:
+            if file.lower().endswith(('.tif', '.tiff', '.png')):
+                tiff_files.append(os.path.join(root, file))
     
     if not tiff_files:
         print("❌ No TIFF files found in farm directory")

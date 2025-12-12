@@ -662,13 +662,22 @@ async def get_farm_data(farm_id: str, current_user: dict = Depends(get_current_u
         raise HTTPException(status_code=404, detail="Farm not found")
     
     farm_path = farm_entry['farm_path']
-    images = [os.path.join(farm_path, f) for f in os.listdir(farm_path)
-              if f.lower().endswith(('.tif', '.tiff', '.png'))]
+    
+    # Recursively find images in year subdirectories (2024/, 2025/, etc.)
+    images = []
+    for root, dirs, files in os.walk(farm_path):
+        for f in files:
+            if f.lower().endswith(('.tif', '.tiff', '.png')):
+                images.append(os.path.join(root, f))
+    
     images.sort(key=lambda x: parse_date_from_filename(x))
     
     thumbnails = []
     for idx, img_path in enumerate(images):
         filename = os.path.basename(img_path)
+        # Get relative path from farm_path (e.g., "2024/Dec_2024_05.png")
+        relative_path = os.path.relpath(img_path, farm_path)
+        
         try:
             date_tuple = parse_date_from_filename(img_path)
             year, month, day = date_tuple
@@ -681,10 +690,10 @@ async def get_farm_data(farm_id: str, current_user: dict = Depends(get_current_u
             
             thumbnails.append({
                 'index': idx,
-                'filename': filename,
+                'filename': relative_path.replace('\\', '/'),  # Use relative path with forward slashes
                 'date_display': date_display,
                 'sort_date': date_tuple,
-                'original_path': os.path.join(farm_path, filename)
+                'original_path': img_path
             })
         except Exception:
             continue
@@ -801,6 +810,7 @@ async def serve_image(farm_id: str, filename: str):
     if not os.path.isdir(safe_farm):
         raise HTTPException(status_code=404, detail='Invalid farm id')
     
+    # Handle year subdirectories (e.g., "2024/Dec_2024_05.png")
     file_path = os.path.join(safe_farm, filename)
     if not os.path.isfile(file_path):
         raise HTTPException(status_code=404, detail='File not found')
@@ -819,6 +829,7 @@ async def serve_image(farm_id: str, filename: str):
 @app.get("/thumbs/{farm_id}/{filename:path}")
 async def serve_thumb(farm_id: str, filename: str):
     """Serve thumbnail"""
+    # Handle year subdirectories (e.g., "2024/Dec_2024_05.png")
     img_full = os.path.join(FARM_DATASET_DIR, farm_id, filename)
     
     if not os.path.isfile(img_full):
