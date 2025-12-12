@@ -45,7 +45,7 @@ CNH/
 ├── farm_dataset/         # Farm images dataset
 ├── thumbnail_cache/      # Generated thumbnails
 ├── harvest_annotations.csv # Annotation output
-├── farm_index.json       # Farm index for large datasets
+
 └── ...
 ```
 
@@ -140,7 +140,6 @@ farm_id,selected_image,image_path,total_images,timestamp
 
 ## 🛠️ Advanced Features & Notes
 
-- **Farm Index**: For large datasets, `farm_index.json` is used to avoid repeated filesystem scans.
 - **Batch Claiming**: Annotators can claim/release batches of farms for efficient annotation.
 - **Thumbnail Cache**: Disk-backed LRU cache in `thumbnail_cache/` for fast image serving.
 - **Admin Diagnostics**: `/api/admin/tasks` for monitoring assignments and progress.

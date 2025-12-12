@@ -11,12 +11,7 @@ import json
 import csv
 import io
 from datetime import datetime, timedelta
-from PIL import Image
-import hashlib
-import re
-import numpy as np
 from typing import Optional, Dict, Any, List
-import rasterio
 from dotenv import load_dotenv
 
 # Local imports
@@ -40,7 +35,7 @@ from auth import (
     create_access_token, 
     decode_access_token
 )
-from image_utils import make_thumbnail, parse_date_from_filename
+from image_utils import parse_date_from_filename
 
 load_dotenv()
 
@@ -66,11 +61,6 @@ app.add_middleware(
 # Root directory
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FARM_DATASET_DIR = os.path.join(ROOT_DIR, "farm_dataset")
-FARM_INDEX_PATH = os.path.join(ROOT_DIR, 'farm_index.json')
-
-# Thumbnail cache
-THUMB_CACHE_DIR = os.path.join(ROOT_DIR, 'thumbnail_cache')
-os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
 
 
 # Startup/Shutdown Events
@@ -178,24 +168,8 @@ def build_farm_index(force: bool = False) -> List[Dict[str, str]]:
                 farm_path = os.path.join(FARM_DATASET_DIR, farm_id)
                 farm_list.append({'farm_id': farm_id, 'farm_path': farm_path})
 
-            if farm_list:
-                _FARM_INDEX = farm_list
-                try:
-                    with open(FARM_INDEX_PATH, 'w') as fh:
-                        json.dump(_FARM_INDEX, fh)
-                except Exception:
-                    pass
-                return _FARM_INDEX
         except Exception:
             farm_list = []
-
-    if os.path.exists(FARM_INDEX_PATH) and not force:
-        try:
-            with open(FARM_INDEX_PATH, 'r') as fh:
-                _FARM_INDEX = json.load(fh)
-                return _FARM_INDEX
-        except Exception:
-            pass
 
     _FARM_INDEX = farm_list
     return _FARM_INDEX
@@ -805,7 +779,7 @@ async def get_annotator_stats(current_user: dict = Depends(get_current_user)):
 
 @app.get("/thumbnails/{farm_id}/{filename:path}")
 async def serve_image(farm_id: str, filename: str):
-    """Serve original images"""
+    """Serve original images - direct serving without caching"""
     safe_farm = os.path.join(FARM_DATASET_DIR, farm_id)
     if not os.path.isdir(safe_farm):
         raise HTTPException(status_code=404, detail='Invalid farm id')
@@ -815,53 +789,25 @@ async def serve_image(farm_id: str, filename: str):
     if not os.path.isfile(file_path):
         raise HTTPException(status_code=404, detail='File not found')
     
-    # If TIFF, convert to PNG
-    if filename.lower().endswith(('.tif', '.tiff')):
-        thumb_path = make_thumbnail(file_path, width=800, height=800)
-        if thumb_path and os.path.isfile(thumb_path):
-            response = FileResponse(thumb_path, media_type='image/png')
-            response.headers["Cache-Control"] = "public, max-age=2592000"
-            return response
-    
-    return FileResponse(file_path)
+    # Serve PNG files directly
+    response = FileResponse(file_path, media_type='image/png')
+    response.headers["Cache-Control"] = "public, max-age=2592000"
+    return response
 
 
 @app.get("/thumbs/{farm_id}/{filename:path}")
 async def serve_thumb(farm_id: str, filename: str):
-    """Serve thumbnail"""
+    """Serve thumbnail - direct serving without caching"""
     # Handle year subdirectories (e.g., "2024/Dec_2024_05.png")
     img_full = os.path.join(FARM_DATASET_DIR, farm_id, filename)
     
     if not os.path.isfile(img_full):
         raise HTTPException(status_code=404, detail='File not found')
     
-    # Look for cached thumbnail
-    sized_thumb = None
-    try:
-        base_hash = hashlib.sha256(img_full.encode('utf-8')).hexdigest()
-        for fn in os.listdir(THUMB_CACHE_DIR):
-            if fn.startswith(base_hash):
-                sized_thumb = os.path.join(THUMB_CACHE_DIR, fn)
-                break
-    except Exception:
-        pass
-    
-    if sized_thumb and os.path.isfile(sized_thumb):
-        response = FileResponse(sized_thumb, media_type='image/png')
-        response.headers["Cache-Control"] = "public, max-age=2592000"
-        return response
-    
-    # Generate thumbnail
-    thumb_path = make_thumbnail(img_full, width=300, height=300)
-    if thumb_path and os.path.isfile(thumb_path):
-        response = FileResponse(thumb_path, media_type='image/png')
-        response.headers["Cache-Control"] = "public, max-age=2592000"
-        return response
-    
-    if img_full.lower().endswith(('.tif', '.tiff')):
-        raise HTTPException(status_code=500, detail='Failed to generate thumbnail for TIFF')
-    
-    return FileResponse(img_full)
+    # Serve PNG files directly
+    response = FileResponse(img_full, media_type='image/png')
+    response.headers["Cache-Control"] = "public, max-age=2592000"
+    return response
 
 
 if __name__ == '__main__':
