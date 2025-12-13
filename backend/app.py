@@ -1,9 +1,10 @@
 """
 FastAPI Farm Harvest Annotation Tool with JWT Auth & MongoDB
 Complete system with authentication, admin dashboard, and MongoDB Atlas
+Supports both local and S3 storage
 """
 from fastapi import FastAPI, HTTPException, Depends, status, Query
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import os
@@ -36,6 +37,7 @@ from auth import (
     decode_access_token
 )
 from image_utils import parse_date_from_filename
+from storage import init_storage, get_storage_instance
 
 load_dotenv()
 
@@ -58,17 +60,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Root directory
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FARM_DATASET_DIR = os.path.join(ROOT_DIR, "farm_dataset")
+# Initialize storage backend
+storage = None
 
 
 # Startup/Shutdown Events
 @app.on_event("startup")
 async def startup_db_client():
-    """Connect to MongoDB on startup"""
+    """Connect to MongoDB and initialize storage on startup"""
+    global storage
     await connect_to_mongo()
     await initialize_default_admin()
+    storage = init_storage()  # Initialize storage backend
 
 
 @app.on_event("shutdown")
@@ -153,30 +156,28 @@ _FARM_INDEX: Optional[List[Dict[str, str]]] = None
 
 
 def build_farm_index(force: bool = False) -> List[Dict[str, str]]:
-    """Build farm index from dataset directory"""
+    """Build farm index from storage backend"""
     global _FARM_INDEX
     if _FARM_INDEX is not None and not force:
         return _FARM_INDEX
     
+    storage_backend = get_storage_instance()
     farm_list = []
-    if os.path.isdir(FARM_DATASET_DIR):
-        try:
-            farm_dirs = [d for d in os.listdir(FARM_DATASET_DIR)
-                         if os.path.isdir(os.path.join(FARM_DATASET_DIR, d)) and d != "0"]
-            farm_dirs.sort()
-            for farm_id in farm_dirs:
-                farm_path = os.path.join(FARM_DATASET_DIR, farm_id)
-                farm_list.append({'farm_id': farm_id, 'farm_path': farm_path})
-
-        except Exception:
-            farm_list = []
+    
+    try:
+        farm_ids = storage_backend.list_farms()
+        for farm_id in farm_ids:
+            farm_list.append({'farm_id': farm_id})
+    except Exception as e:
+        print(f"Error building farm index: {e}")
+        farm_list = []
 
     _FARM_INDEX = farm_list
     return _FARM_INDEX
 
 
-# Build index on startup
-build_farm_index()
+# Build index on startup (after storage is initialized)
+# Will be called from startup event
 
 
 # ============================================================================
@@ -629,48 +630,52 @@ async def get_farm_data(farm_id: str, current_user: dict = Depends(get_current_u
         )
     
     # Get farm images
-    farms = build_farm_index()
-    farm_entry = next((f for f in farms if f['farm_id'] == farm_id), None)
+    storage_backend = get_storage_instance()
     
-    if not farm_entry:
+    if not storage_backend.farm_exists(farm_id):
         raise HTTPException(status_code=404, detail="Farm not found")
     
-    farm_path = farm_entry['farm_path']
+    # Get all image paths from storage
+    image_paths = storage_backend.list_images(farm_id)
     
-    # Recursively find images in year subdirectories (2024/, 2025/, etc.)
-    images = []
-    for root, dirs, files in os.walk(farm_path):
-        for f in files:
-            if f.lower().endswith(('.tif', '.tiff', '.png')):
-                images.append(os.path.join(root, f))
-    
-    images.sort(key=lambda x: parse_date_from_filename(x))
-    
-    thumbnails = []
-    for idx, img_path in enumerate(images):
-        filename = os.path.basename(img_path)
-        # Get relative path from farm_path (e.g., "2024/Dec_2024_05.png")
-        relative_path = os.path.relpath(img_path, farm_path)
-        
+    # Sort by date
+    image_data = []
+    for img_path in image_paths:
         try:
-            date_tuple = parse_date_from_filename(img_path)
-            year, month, day = date_tuple
-            month_names = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-                          'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-            if month > 0:
-                date_display = f"{month_names[month]} {day}, {year}" if day > 0 else f"{month_names[month]} {year}"
-            else:
-                date_display = f"{year}"
-            
-            thumbnails.append({
-                'index': idx,
-                'filename': relative_path.replace('\\', '/'),  # Use relative path with forward slashes
-                'date_display': date_display,
-                'sort_date': date_tuple,
-                'original_path': img_path
+            # Create a temporary full path for date parsing
+            temp_path = f"/{farm_id}/{img_path}"
+            date_tuple = parse_date_from_filename(temp_path)
+            image_data.append({
+                'path': img_path,
+                'date': date_tuple
             })
         except Exception:
-            continue
+            # If date parsing fails, add with default date
+            image_data.append({
+                'path': img_path,
+                'date': (1900, 1, 1)
+            })
+    
+    image_data.sort(key=lambda x: x['date'])
+    
+    thumbnails = []
+    for idx, img_info in enumerate(image_data):
+        img_path = img_info['path']
+        year, month, day = img_info['date']
+        
+        month_names = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        if month > 0:
+            date_display = f"{month_names[month]} {day}, {year}" if day > 0 else f"{month_names[month]} {year}"
+        else:
+            date_display = f"{year}" if year > 1900 else "Unknown"
+        
+        thumbnails.append({
+            'index': idx,
+            'filename': img_path,
+            'date_display': date_display,
+            'sort_date': img_info['date']
+        })
     
     thumbnails.sort(key=lambda x: x['sort_date'])
     
@@ -691,7 +696,7 @@ async def get_farm_data(farm_id: str, current_user: dict = Depends(get_current_u
     
     return {
         'farm_id': farm_id,
-        'image_count': len(images),
+        'image_count': len(image_data),
         'thumbnails': thumbnails,
         'selected_index': selected_index
     }
@@ -779,42 +784,59 @@ async def get_annotator_stats(current_user: dict = Depends(get_current_user)):
 
 @app.get("/thumbnails/{farm_id}/{filename:path}")
 async def serve_image(farm_id: str, filename: str):
-    """Serve original images - direct serving without caching"""
-    safe_farm = os.path.join(FARM_DATASET_DIR, farm_id)
-    if not os.path.isdir(safe_farm):
+    """Serve original images from storage backend"""
+    storage_backend = get_storage_instance()
+    
+    if not storage_backend.farm_exists(farm_id):
         raise HTTPException(status_code=404, detail='Invalid farm id')
     
-    # Handle year subdirectories (e.g., "2024/Dec_2024_05.png")
-    file_path = os.path.join(safe_farm, filename)
-    if not os.path.isfile(file_path):
+    if not storage_backend.image_exists(farm_id, filename):
         raise HTTPException(status_code=404, detail='File not found')
     
-    # Serve PNG files directly
-    response = FileResponse(file_path, media_type='image/png')
-    response.headers["Cache-Control"] = "public, max-age=2592000"
-    return response
+    try:
+        # Get image content from storage
+        image_data = storage_backend.get_image(farm_id, filename)
+        
+        # Return as response
+        response = Response(content=image_data, media_type='image/png')
+        response.headers["Cache-Control"] = "public, max-age=2592000"
+        return response
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail='File not found')
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Error loading image: {str(e)}')
 
 
 @app.get("/thumbs/{farm_id}/{filename:path}")
 async def serve_thumb(farm_id: str, filename: str):
-    """Serve thumbnail - direct serving without caching"""
-    # Handle year subdirectories (e.g., "2024/Dec_2024_05.png")
-    img_full = os.path.join(FARM_DATASET_DIR, farm_id, filename)
+    """Serve thumbnail from storage backend"""
+    storage_backend = get_storage_instance()
     
-    if not os.path.isfile(img_full):
+    if not storage_backend.image_exists(farm_id, filename):
         raise HTTPException(status_code=404, detail='File not found')
     
-    # Serve PNG files directly
-    response = FileResponse(img_full, media_type='image/png')
-    response.headers["Cache-Control"] = "public, max-age=2592000"
-    return response
+    try:
+        # Get image content from storage
+        image_data = storage_backend.get_image(farm_id, filename)
+        
+        # Return as response
+        response = Response(content=image_data, media_type='image/png')
+        response.headers["Cache-Control"] = "public, max-age=2592000"
+        return response
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail='File not found')
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Error loading image: {str(e)}')
 
 
 if __name__ == '__main__':
     import uvicorn
     
+    use_s3 = os.getenv('USE_S3', 'false').lower() == 'true'
+    storage_type = "S3" if use_s3 else "Local"
+    
     print(f"🌾 Farm Harvest Annotation Server v3.0 (FastAPI + MongoDB)")
-    print(f"📁 Farm dataset: {FARM_DATASET_DIR}")
+    print(f"💾 Storage: {storage_type}")
     print(f"🔐 JWT Authentication enabled")
     print(f"💾 MongoDB Atlas integration")
     print(f"👤 Admin dashboard available")
