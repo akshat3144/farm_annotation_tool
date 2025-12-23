@@ -54,8 +54,8 @@ export function Login() {
     <div className={styles.loginContainer}>
       <div className={styles.loginCard}>
         <div className={styles.loginHeader}>
-          <h1>🌾 Farm Annotation Tool</h1>
-          <p>Sign in to continue</p>
+          <h1>Farm Harvest Annotation System</h1>
+          <p>Please sign in to continue</p>
         </div>
 
         <form onSubmit={handleLogin} className={styles.loginForm}>
@@ -68,7 +68,7 @@ export function Login() {
               type="text"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
-              placeholder="Enter your username"
+              placeholder="Username"
               required
               autoComplete="username"
             />
@@ -81,7 +81,7 @@ export function Login() {
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              placeholder="Enter your password"
+              placeholder="Password"
               required
               autoComplete="current-password"
             />
@@ -95,13 +95,6 @@ export function Login() {
             {loading ? "Signing in..." : "Sign In"}
           </button>
         </form>
-
-        <div className={styles.loginFooter}>
-          <p className={styles.defaultCredentials}>
-            Default admin credentials: <strong>admin</strong> /{" "}
-            <strong>admin123</strong>
-          </p>
-        </div>
       </div>
     </div>
   );

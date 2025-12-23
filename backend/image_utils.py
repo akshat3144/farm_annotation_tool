@@ -45,6 +45,7 @@ def parse_date_from_filename(filename_or_path: str) -> tuple:
     
     # Try different legacy patterns
     patterns = [
+        r'([a-z]+)_(\d{4})_(\d+)',  # Month_Year_Day format (e.g., Dec_2024_05)
         r'([a-z]+)_(\d{4})',
         r'(\d+)([a-z]+),(\d{4})',
         r'(\d+)([a-z]+)(\d{4})',
@@ -62,12 +63,23 @@ def parse_date_from_filename(filename_or_path: str) -> tuple:
                     return (int(year_str), month_map[month_str], 1)
                     
             elif len(groups) == 3:
-                if groups[0].isdigit():
-                    day_str, month_str, year_str = groups
-                    if month_str in month_map:
+                # Check if first group is month name
+                if groups[0] in month_map:
+                    month_str = groups[0]
+                    # Check if second group is year (4 digits)
+                    if len(groups[1]) == 4:
+                        # Pattern: Month_Year_Day
+                        year_str = groups[1]
+                        day_str = groups[2]
                         return (int(year_str), month_map[month_str], int(day_str))
-                else:
-                    month_str, day_str, year_str = groups
+                    else:
+                        # Pattern: Month_Day_Year
+                        day_str = groups[1]
+                        year_str = groups[2]
+                        return (int(year_str), month_map[month_str], int(day_str))
+                # Check if first group is digit (day)
+                elif groups[0].isdigit():
+                    day_str, month_str, year_str = groups
                     if month_str in month_map:
                         return (int(year_str), month_map[month_str], int(day_str))
     

@@ -101,7 +101,7 @@ async def initialize_default_admin():
             "created_at": datetime.now()
         }
         await users_collection.insert_one(admin_user)
-        print(f"✓ Default admin user created: {admin_username}")
+        print(f"[INFO] Default administrator account created: {admin_username}")
 
 
 # Authentication Dependency
@@ -188,29 +188,24 @@ def build_farm_index(force: bool = False) -> List[Dict[str, str]]:
 async def index():
     """API documentation"""
     return {
-        'message': 'Farm Harvest Annotation Tool API v3.0',
-        'features': [
-            'JWT Authentication',
-            'MongoDB Atlas Integration',
-            'Admin Dashboard',
-            'User Management',
-            'Farm Assignment System'
-        ],
-        'auth': {
+        'name': 'Farm Harvest Annotation Tool API',
+        'version': '3.0',
+        'description': 'Enterprise-grade farm harvest annotation platform with authentication and assignment management',
+        'authentication': {
             'login': 'POST /api/auth/login',
-            'me': 'GET /api/auth/me'
+            'current_user': 'GET /api/auth/me'
         },
-        'admin': {
+        'administration': {
             'users': 'GET/POST /api/admin/users',
             'assignments': 'GET/POST /api/admin/assignments',
-            'stats': 'GET /api/admin/stats',
-            'download': 'GET /api/admin/download'
+            'statistics': 'GET /api/admin/stats',
+            'export': 'GET /api/admin/download'
         },
-        'annotator': {
+        'annotation': {
             'assigned_farms': 'GET /api/annotator/assigned-farms',
             'farm_data': 'GET /api/annotator/farm/{farm_id}',
             'save_annotation': 'POST /api/annotator/save',
-            'my_stats': 'GET /api/annotator/stats'
+            'statistics': 'GET /api/annotator/stats'
         }
     }
 
@@ -393,7 +388,7 @@ async def create_assignment(
     assignment_data: dict,
     admin: dict = Depends(require_admin)
 ):
-    """Create farm assignment (admin only)"""
+    """Create farm assignment or add to existing assignment (admin only)"""
     db = get_database()
     from bson import ObjectId
     
@@ -427,25 +422,50 @@ async def create_assignment(
     # Select farms to assign
     farm_ids = unassigned_farms[:farm_count]
     
-    # Create assignment
-    new_assignment = {
-        "user_id": user_id,
-        "username": user["username"],
-        "farm_ids": farm_ids,
-        "assigned_at": datetime.now(),
-        "completed_count": 0,
-        "status": "active"
-    }
+    # Check if user already has an assignment
+    existing_assignment = await db[ASSIGNMENTS_COLLECTION].find_one({"user_id": user_id})
     
-    result = await db[ASSIGNMENTS_COLLECTION].insert_one(new_assignment)
-    
-    return {
-        "id": str(result.inserted_id),
-        "user_id": user_id,
-        "username": user["username"],
-        "farm_ids": farm_ids,
-        "assigned_count": len(farm_ids)
-    }
+    if existing_assignment:
+        # Add farms to existing assignment
+        updated_farm_ids = existing_assignment.get("farm_ids", []) + farm_ids
+        
+        await db[ASSIGNMENTS_COLLECTION].update_one(
+            {"_id": existing_assignment["_id"]},
+            {"$set": {
+                "farm_ids": updated_farm_ids,
+                "assigned_at": datetime.now()
+            }}
+        )
+        
+        return {
+            "id": str(existing_assignment["_id"]),
+            "user_id": user_id,
+            "username": user["username"],
+            "farm_ids": updated_farm_ids,
+            "assigned_count": len(updated_farm_ids),
+            "message": f"Added {len(farm_ids)} farms to existing assignment"
+        }
+    else:
+        # Create new assignment
+        new_assignment = {
+            "user_id": user_id,
+            "username": user["username"],
+            "farm_ids": farm_ids,
+            "assigned_at": datetime.now(),
+            "completed_count": 0,
+            "status": "active"
+        }
+        
+        result = await db[ASSIGNMENTS_COLLECTION].insert_one(new_assignment)
+        
+        return {
+            "id": str(result.inserted_id),
+            "user_id": user_id,
+            "username": user["username"],
+            "farm_ids": farm_ids,
+            "assigned_count": len(farm_ids),
+            "message": f"Created new assignment with {len(farm_ids)} farms"
+        }
 
 
 @app.delete("/api/admin/assignments/{assignment_id}")
@@ -529,17 +549,26 @@ async def download_annotations(admin: dict = Depends(require_admin), format: str
     annotations = await db[ANNOTATIONS_COLLECTION].find().to_list(10000)
     
     if format == "csv":
-        # Create CSV
+        # Create CSV with both 2024 and 2025 selections
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(["farm_id", "username", "selected_image", "image_path", "total_images", "timestamp"])
+        writer.writerow([
+            "farm_id", "username", 
+            "selected_image_2024", "image_path_2024", "total_images_2024",
+            "selected_image_2025", "image_path_2025", "total_images_2025",
+            "total_images", "timestamp"
+        ])
         
         for annotation in annotations:
             writer.writerow([
                 annotation["farm_id"],
                 annotation["username"],
-                annotation["selected_image"],
-                annotation["image_path"],
+                annotation.get("selected_image_2024", ""),
+                annotation.get("image_path_2024", ""),
+                annotation.get("total_images_2024", ""),
+                annotation.get("selected_image_2025", ""),
+                annotation.get("image_path_2025", ""),
+                annotation.get("total_images_2025", ""),
                 annotation.get("total_images", ""),
                 annotation.get("timestamp", datetime.now()).isoformat()
             ])
@@ -552,15 +581,19 @@ async def download_annotations(admin: dict = Depends(require_admin), format: str
         )
     
     elif format == "json":
-        # Return as JSON
+        # Return as JSON with both 2024 and 2025 selections
         result = []
         for annotation in annotations:
             result.append({
                 "id": str(annotation["_id"]),
                 "farm_id": annotation["farm_id"],
                 "username": annotation["username"],
-                "selected_image": annotation["selected_image"],
-                "image_path": annotation["image_path"],
+                "selected_image_2024": annotation.get("selected_image_2024"),
+                "image_path_2024": annotation.get("image_path_2024"),
+                "total_images_2024": annotation.get("total_images_2024"),
+                "selected_image_2025": annotation.get("selected_image_2025"),
+                "image_path_2025": annotation.get("image_path_2025"),
+                "total_images_2025": annotation.get("total_images_2025"),
                 "total_images": annotation.get("total_images"),
                 "timestamp": annotation.get("timestamp", datetime.now()).isoformat()
             })
@@ -658,7 +691,10 @@ async def get_farm_data(farm_id: str, current_user: dict = Depends(get_current_u
     
     image_data.sort(key=lambda x: x['date'])
     
-    thumbnails = []
+    # Separate images by year (2024 and 2025)
+    thumbnails_2024 = []
+    thumbnails_2025 = []
+    
     for idx, img_info in enumerate(image_data):
         img_path = img_info['path']
         year, month, day = img_info['date']
@@ -670,14 +706,28 @@ async def get_farm_data(farm_id: str, current_user: dict = Depends(get_current_u
         else:
             date_display = f"{year}" if year > 1900 else "Unknown"
         
-        thumbnails.append({
+        thumb_data = {
             'index': idx,
             'filename': img_path,
             'date_display': date_display,
-            'sort_date': img_info['date']
-        })
+            'sort_date': img_info['date'],
+            'original_path': img_path
+        }
+        
+        # Group by year
+        if year == 2024:
+            thumbnails_2024.append(thumb_data)
+        elif year == 2025:
+            thumbnails_2025.append(thumb_data)
     
-    thumbnails.sort(key=lambda x: x['sort_date'])
+    thumbnails_2024.sort(key=lambda x: x['sort_date'])
+    thumbnails_2025.sort(key=lambda x: x['sort_date'])
+    
+    # Reindex thumbnails within each year group
+    for idx, thumb in enumerate(thumbnails_2024):
+        thumb['index'] = idx
+    for idx, thumb in enumerate(thumbnails_2025):
+        thumb['index'] = idx
     
     # Check if user has already annotated this farm
     existing_annotation = await db[ANNOTATIONS_COLLECTION].find_one({
@@ -685,20 +735,32 @@ async def get_farm_data(farm_id: str, current_user: dict = Depends(get_current_u
         "farm_id": farm_id
     })
     
-    selected_index = None
+    selected_index_2024 = None
+    selected_index_2025 = None
     if existing_annotation:
-        selected_image = existing_annotation.get("selected_image")
-        # Find index of selected image
-        for idx, thumb in enumerate(thumbnails):
-            if thumb['filename'] == selected_image:
-                selected_index = idx
-                break
+        # Find index of selected images for each year
+        selected_image_2024 = existing_annotation.get("selected_image_2024")
+        selected_image_2025 = existing_annotation.get("selected_image_2025")
+        
+        if selected_image_2024:
+            for idx, thumb in enumerate(thumbnails_2024):
+                if thumb['filename'] == selected_image_2024:
+                    selected_index_2024 = idx
+                    break
+        
+        if selected_image_2025:
+            for idx, thumb in enumerate(thumbnails_2025):
+                if thumb['filename'] == selected_image_2025:
+                    selected_index_2025 = idx
+                    break
     
     return {
         'farm_id': farm_id,
         'image_count': len(image_data),
-        'thumbnails': thumbnails,
-        'selected_index': selected_index
+        'thumbnails_2024': thumbnails_2024,
+        'thumbnails_2025': thumbnails_2025,
+        'selected_index_2024': selected_index_2024,
+        'selected_index_2025': selected_index_2025
     }
 
 
@@ -707,16 +769,24 @@ async def save_annotation(
     annotation_data: dict,
     current_user: dict = Depends(get_current_user)
 ):
-    """Save annotation"""
+    """Save annotation with selections for both 2024 and 2025"""
     db = get_database()
     
     farm_id = annotation_data.get("farm_id")
-    selected_image = annotation_data.get("selected_image")
-    image_path = annotation_data.get("image_path")
+    selected_image_2024 = annotation_data.get("selected_image_2024")
+    image_path_2024 = annotation_data.get("image_path_2024")
+    selected_image_2025 = annotation_data.get("selected_image_2025")
+    image_path_2025 = annotation_data.get("image_path_2025")
     total_images = annotation_data.get("total_images")
+    total_images_2024 = annotation_data.get("total_images_2024")
+    total_images_2025 = annotation_data.get("total_images_2025")
     
-    if not farm_id or not selected_image:
-        raise HTTPException(status_code=400, detail="Missing required fields")
+    if not farm_id:
+        raise HTTPException(status_code=400, detail="Missing farm_id")
+    
+    # At least one image should be selected
+    if not selected_image_2024 and not selected_image_2025:
+        raise HTTPException(status_code=400, detail="At least one image selection is required")
     
     # Check if farm is assigned to user
     assignment = await db[ASSIGNMENTS_COLLECTION].find_one({
@@ -735,9 +805,13 @@ async def save_annotation(
         "farm_id": farm_id,
         "user_id": current_user["id"],
         "username": current_user["username"],
-        "selected_image": selected_image,
-        "image_path": image_path,
+        "selected_image_2024": selected_image_2024,
+        "image_path_2024": image_path_2024,
+        "selected_image_2025": selected_image_2025,
+        "image_path_2025": image_path_2025,
         "total_images": total_images,
+        "total_images_2024": total_images_2024,
+        "total_images_2025": total_images_2025,
         "timestamp": datetime.now()
     }
     
@@ -835,12 +909,14 @@ if __name__ == '__main__':
     use_s3 = os.getenv('USE_S3', 'false').lower() == 'true'
     storage_type = "S3" if use_s3 else "Local"
     
-    print(f"🌾 Farm Harvest Annotation Server v3.0 (FastAPI + MongoDB)")
-    print(f"💾 Storage: {storage_type}")
-    print(f"🔐 JWT Authentication enabled")
-    print(f"💾 MongoDB Atlas integration")
-    print(f"👤 Admin dashboard available")
-    print(f"🌐 Starting server at http://localhost:5005")
+    print("="*60)
+    print("Farm Harvest Annotation Server v3.0")
+    print("="*60)
+    print(f"Storage Backend: {storage_type}")
+    print(f"Authentication: JWT Enabled")
+    print(f"Database: MongoDB Atlas")
+    print(f"Server: http://localhost:5005")
+    print("="*60)
     
     uvicorn.run(
         "app:app",

@@ -81,9 +81,14 @@ class AnnotationBase(BaseModel):
     farm_id: str
     user_id: str
     username: str
-    selected_image: str
-    image_path: str
+    # Updated to support 2 images: one from 2024, one from 2025
+    selected_image_2024: Optional[str] = None
+    image_path_2024: Optional[str] = None
+    selected_image_2025: Optional[str] = None
+    image_path_2025: Optional[str] = None
     total_images: Optional[int] = None
+    total_images_2024: Optional[int] = None
+    total_images_2025: Optional[int] = None
 
 
 class AnnotationCreate(AnnotationBase):

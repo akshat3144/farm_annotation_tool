@@ -97,24 +97,3 @@
   color: #c53030;
   font-size: 14px;
 }
-
-.loginFooter {
-  margin-top: 24px;
-  padding-top: 24px;
-  border-top: 1px solid #e2e8f0;
-  text-align: center;
-}
-
-.defaultCredentials {
-  font-size: 13px;
-  color: #718096;
-  margin: 0;
-}
-
-.defaultCredentials strong {
-  color: #2d3748;
-  font-family: monospace;
-  background: #edf2f7;
-  padding: 2px 6px;
-  border-radius: 4px;
-}

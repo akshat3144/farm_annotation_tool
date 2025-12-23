@@ -99,11 +99,24 @@ export function AdminDashboard() {
         const data = await response.json();
         setUsers(data);
       } else if (activeTab === "assignments") {
-        const response = await fetch(`${API_BASE}/api/admin/assignments`, {
-          headers: getAuthHeaders(),
-        });
-        const data = await response.json();
-        setAssignments(data);
+        // Load assignments, users, and stats for the assignments tab
+        const [assignmentsRes, usersRes, statsRes] = await Promise.all([
+          fetch(`${API_BASE}/api/admin/assignments`, {
+            headers: getAuthHeaders(),
+          }),
+          fetch(`${API_BASE}/api/admin/users`, {
+            headers: getAuthHeaders(),
+          }),
+          fetch(`${API_BASE}/api/admin/stats`, {
+            headers: getAuthHeaders(),
+          }),
+        ]);
+        const assignmentsData = await assignmentsRes.json();
+        const usersData = await usersRes.json();
+        const statsData = await statsRes.json();
+        setAssignments(assignmentsData);
+        setUsers(usersData);
+        setStats(statsData);
       }
     } catch (error) {
       console.error("Error loading data:", error);
@@ -237,11 +250,11 @@ export function AdminDashboard() {
     <div className={styles.dashboard}>
       <header className={styles.header}>
         <div className={styles.headerContent}>
-          <h1>🌾 Farm Annotation - Admin Dashboard</h1>
+          <h1>Farm Annotation System - Administration</h1>
           <div className={styles.headerActions}>
-            <span className={styles.userName}>Welcome, {user?.username}</span>
+            <span className={styles.userName}>{user?.username}</span>
             <button onClick={handleLogout} className={styles.logoutButton}>
-              Logout
+              Sign Out
             </button>
           </div>
         </div>
@@ -252,13 +265,13 @@ export function AdminDashboard() {
           className={activeTab === "stats" ? styles.tabActive : styles.tab}
           onClick={() => setActiveTab("stats")}
         >
-          📊 Statistics
+          Statistics
         </button>
         <button
           className={activeTab === "users" ? styles.tabActive : styles.tab}
           onClick={() => setActiveTab("users")}
         >
-          👥 Users
+          User Management
         </button>
         <button
           className={
@@ -266,7 +279,7 @@ export function AdminDashboard() {
           }
           onClick={() => setActiveTab("assignments")}
         >
-          📋 Assignments
+          Farm Assignments
         </button>
       </nav>
 
@@ -279,41 +292,39 @@ export function AdminDashboard() {
               <div className={styles.statsView}>
                 <div className={styles.statsGrid}>
                   <div className={styles.statCard}>
-                    <div className={styles.statIcon}>👥</div>
                     <div className={styles.statValue}>{stats.total_users}</div>
                     <div className={styles.statLabel}>Total Users</div>
                   </div>
                   <div className={styles.statCard}>
-                    <div className={styles.statIcon}>🚜</div>
                     <div className={styles.statValue}>{stats.total_farms}</div>
                     <div className={styles.statLabel}>Total Farms</div>
                   </div>
                   <div className={styles.statCard}>
-                    <div className={styles.statIcon}>✅</div>
                     <div className={styles.statValue}>
                       {stats.assigned_farms}
                     </div>
                     <div className={styles.statLabel}>Assigned Farms</div>
                   </div>
                   <div className={styles.statCard}>
-                    <div className={styles.statIcon}>📝</div>
                     <div className={styles.statValue}>
                       {stats.total_annotations}
                     </div>
-                    <div className={styles.statLabel}>Total Annotations</div>
+                    <div className={styles.statLabel}>
+                      Completed Annotations
+                    </div>
                   </div>
                 </div>
 
                 <div className={styles.section}>
                   <div className={styles.sectionHeader}>
-                    <h2>User Progress</h2>
+                    <h2>Annotator Progress</h2>
                     <div className={styles.actionButtons}>
                       <button
                         onClick={handleClearAllAnnotations}
                         className={styles.dangerButton}
                         title="Delete all annotations"
                       >
-                        🗑️ Clear All Annotations
+                        Clear All Annotations
                       </button>
                     </div>
                   </div>
@@ -352,19 +363,19 @@ export function AdminDashboard() {
                 </div>
 
                 <div className={styles.section}>
-                  <h2>Download Annotations</h2>
+                  <h2>Export Annotation Data</h2>
                   <div className={styles.downloadButtons}>
                     <button
                       onClick={() => handleDownload("csv")}
                       className={styles.downloadButton}
                     >
-                      📥 Download CSV
+                      Export as CSV
                     </button>
                     <button
                       onClick={() => handleDownload("json")}
                       className={styles.downloadButton}
                     >
-                      📥 Download JSON
+                      Export as JSON
                     </button>
                   </div>
                 </div>
@@ -379,7 +390,7 @@ export function AdminDashboard() {
                     onClick={() => setShowCreateUser(true)}
                     className={styles.createButton}
                   >
-                    + Create User
+                    Create New User
                   </button>
                 </div>
 
@@ -388,10 +399,7 @@ export function AdminDashboard() {
                     <thead>
                       <tr>
                         <th>Username</th>
-                        <th>Email</th>
-                        <th>Full Name</th>
                         <th>Role</th>
-                        <th>Status</th>
                         <th>Created</th>
                         <th>Actions</th>
                       </tr>
@@ -400,8 +408,6 @@ export function AdminDashboard() {
                       {users.map((user) => (
                         <tr key={user.id}>
                           <td>{user.username}</td>
-                          <td>{user.email || "-"}</td>
-                          <td>{user.full_name || "-"}</td>
                           <td>
                             <span
                               className={
@@ -411,17 +417,6 @@ export function AdminDashboard() {
                               }
                             >
                               {user.role}
-                            </span>
-                          </td>
-                          <td>
-                            <span
-                              className={
-                                user.is_active
-                                  ? styles.statusActive
-                                  : styles.statusInactive
-                              }
-                            >
-                              {user.is_active ? "Active" : "Inactive"}
                             </span>
                           </td>
                           <td>
@@ -475,7 +470,7 @@ export function AdminDashboard() {
                       onClick={() => setShowCreateAssignment(true)}
                       className={styles.createButton}
                     >
-                      + Create Assignment
+                      Create New Assignment
                     </button>
                   </div>
                 </div>
@@ -572,8 +567,6 @@ function CreateUserModal({
   const [formData, setFormData] = useState({
     username: "",
     password: "",
-    email: "",
-    full_name: "",
     role: "annotator",
   });
   const [loading, setLoading] = useState(false);
@@ -630,26 +623,6 @@ function CreateUserModal({
                 setFormData({ ...formData, password: e.target.value })
               }
               required
-            />
-          </div>
-          <div className={styles.formGroup}>
-            <label>Email</label>
-            <input
-              type="email"
-              value={formData.email}
-              onChange={(e) =>
-                setFormData({ ...formData, email: e.target.value })
-              }
-            />
-          </div>
-          <div className={styles.formGroup}>
-            <label>Full Name</label>
-            <input
-              type="text"
-              value={formData.full_name}
-              onChange={(e) =>
-                setFormData({ ...formData, full_name: e.target.value })
-              }
             />
           </div>
           <div className={styles.formGroup}>
@@ -754,7 +727,7 @@ function CreateAssignmentModal({
               <option value="">-- Select a user --</option>
               {annotators.map((user) => (
                 <option key={user.id} value={user.id}>
-                  {user.username} ({user.email})
+                  {user.username}
                 </option>
               ))}
             </select>
@@ -765,11 +738,14 @@ function CreateAssignmentModal({
               type="number"
               value={farmCount}
               onChange={(e) => setFarmCount(e.target.value)}
-              placeholder="Enter number of farms (e.g., 10)"
+              placeholder="Enter quantity"
               min="1"
               required
             />
-            <small>System will automatically assign unassigned farms</small>
+            <small>
+              Farms will be automatically selected from available unassigned
+              inventory
+            </small>
           </div>
           <div className={styles.modalActions}>
             <button

@@ -197,6 +197,31 @@
   margin: 0;
 }
 
+.yearSection {
+  background: white;
+  border-radius: 12px;
+  padding: 24px;
+  margin-bottom: 24px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.yearHeader {
+  font-size: 20px;
+  font-weight: 700;
+  color: #1a202c;
+  margin: 0 0 16px 0;
+  padding-bottom: 12px;
+  border-bottom: 2px solid #e2e8f0;
+}
+
+.noImages {
+  text-align: center;
+  padding: 32px;
+  color: #a0aec0;
+  font-size: 14px;
+  font-style: italic;
+}
+
 .imageGrid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
@@ -312,7 +337,11 @@
 .helpText p {
   font-size: 13px;
   color: #718096;
-  margin: 0;
+  margin: 0 0 8px 0;
+}
+
+.helpText p:last-child {
+  margin-bottom: 0;
 }
 
 .helpText strong {
