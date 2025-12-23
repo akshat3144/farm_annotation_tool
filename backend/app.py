@@ -52,7 +52,7 @@ app = FastAPI(
 security = HTTPBearer()
 
 # Enable CORS
-cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:3001").split(",")
+cors_origins = os.getenv("CORS_ORIGINS").split(",")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
